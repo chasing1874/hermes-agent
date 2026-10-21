@@ -198,6 +198,7 @@ _FEISHU_REACTION_FAILURE = "CrossMark"
 # delete-failures, not a capacity plan.
 _FEISHU_PROCESSING_REACTION_CACHE_SIZE = 1024
 _FEISHU_MESSAGE_TEXT_CACHE_SIZE = 512       # LRU cap for reply-context message text lookups
+_FEISHU_THREAD_ANCHOR_CACHE_SIZE = 1024     # LRU cap for thread_id → latest known message_id
 
 # QR onboarding constants
 _ONBOARD_ACCOUNTS_URLS = {
@@ -2633,6 +2634,7 @@ class FeishuAdapter(BasePlatformAdapter):
         # too, so using it as a fallback (#19711) turned ordinary quote replies into topic
         # sessions and pushed the bot's answer into a fresh thread (#20548).
         thread_id = getattr(message, "thread_id", None) or None
+        self._remember_thread_anchor(thread_id, message_id)
         reply_to_message_id = (
             getattr(message, "parent_id", None) or getattr(message, "upper_message_id", None)
             or getattr(message, "root_id", None) or None
@@ -3743,6 +3745,50 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.debug("[Feishu] Failed to fetch last message in thread %s: %s", thread_id, exc)
         return None
 
+    @property
+    def _thread_anchors(self) -> OrderedDict[str, str]:
+        """Latest message seen in each topic: the reply target for sends that have none of their own.
+        Created on first use, so adapters built without ``__init__`` route topic sends too."""
+        return self.__dict__.setdefault("_thread_anchor_cache", OrderedDict())
+
+    def _remember_thread_anchor(self, thread_id: Optional[str], message_id: Optional[str]) -> None:
+        if not thread_id or not message_id:
+            return
+        self._thread_anchors[thread_id] = message_id
+        self._thread_anchors.move_to_end(thread_id)
+        while len(self._thread_anchors) > _FEISHU_THREAD_ANCHOR_CACHE_SIZE:
+            self._thread_anchors.popitem(last=False)
+
+    async def _reply_in_thread(self, *, anchor: str, thread_id: str, msg_type: str, payload: str) -> Any:
+        body = self._build_reply_message_body(
+            content=payload, msg_type=msg_type, reply_in_thread=True, uuid_value=str(uuid.uuid4()),
+        )
+        request = self._build_reply_message_request(anchor, body)
+        response = await self._run_blocking(self._client.im.v1.message.reply, request)
+        if self._response_succeeded(response):
+            self._remember_thread_anchor(thread_id, self._extract_response_field(response, "message_id") or anchor)
+        return response
+
+    async def _send_to_thread_without_reply_target(self, *, thread_id: str, msg_type: str, payload: str) -> Any:
+        """Reply in thread to a message already in the topic; None when no message there can be found.
+
+        Feishu's create API has no ``thread_id`` receive type (it answers 99992402), so topic sends
+        without a reply target of their own — background-process notices, cron deliveries, queued
+        follow-ups — go through the reply API: first to the latest message this adapter saw in the
+        topic, then to one read back from the topic.
+        """
+        cached = self._thread_anchors.get(thread_id)
+        if cached:
+            response = await self._reply_in_thread(anchor=cached, thread_id=thread_id, msg_type=msg_type, payload=payload)
+            if self._response_succeeded(response) or getattr(response, "code", None) not in _FEISHU_REPLY_FALLBACK_CODES:
+                return response
+            self._thread_anchors.pop(thread_id, None)  # withdrawn or deleted: look the topic up instead
+        fetched = await self._fetch_last_message_in_thread(thread_id)
+        if fetched and fetched != cached:
+            return await self._reply_in_thread(anchor=fetched, thread_id=thread_id, msg_type=msg_type, payload=payload)
+        logger.warning("[Feishu] No message to reply to in thread %s; sending to the chat instead", thread_id)
+        return None
+
     async def _send_raw_message(
         self, *, chat_id: str, msg_type: str, payload: str, reply_to: Optional[str], metadata: Optional[dict[str, Any]],
     ) -> Any:
@@ -3753,11 +3799,16 @@ class FeishuAdapter(BasePlatformAdapter):
                 content=payload, msg_type=msg_type, reply_in_thread=bool(thread_id), uuid_value=str(uuid.uuid4()),
             )
             request = self._build_reply_message_request(effective_reply_to, body)
-            return await self._run_blocking(self._client.im.v1.message.reply, request)
+            response = await self._run_blocking(self._client.im.v1.message.reply, request)
+            self._remember_thread_anchor(thread_id, self._extract_response_field(response, "message_id"))
+            return response
         if thread_id:
-            # reply→create fallback inside a topic: thread_id as receive_id keeps it in the topic.
-            receive_id, receive_id_type = thread_id, "thread_id"
-        elif chat_id.startswith("feishu_user_id:"):
+            response = await self._send_to_thread_without_reply_target(
+                thread_id=thread_id, msg_type=msg_type, payload=payload,
+            )
+            if response is not None:
+                return response
+        if chat_id.startswith("feishu_user_id:"):
             receive_id, receive_id_type = chat_id.split(":", 1)[1], "user_id"
         else:
             receive_id, receive_id_type = chat_id, "open_id" if chat_id.startswith("ou_") else "chat_id"
