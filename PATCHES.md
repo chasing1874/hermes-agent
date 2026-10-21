@@ -9,7 +9,9 @@
 ## 当前基线
 
 - 上游 tag：`v0.22.2`（`d923a5eb48`）
-- 正在运行的 Hermes 仍是 `~/.local/share/hermes-stable/app`（官方 v0.22.2，没有打补丁），还没切换到这里。
+- 运行目录 `~/.local/share/hermes-stable/app` 从 2026-10-21 起停在本地分支 `ziyou/patches` 上，跟踪远程 `fork`（`origin` 仍是 NousResearch）。
+- 部署：在运行目录 `git fetch fork && git checkout -B ziyou/patches fork/ziyou/patches`，再执行 `launchctl kickstart -k gui/$(id -u)/ai.hermes.gateway-vediotutor-buddy`。
+- 不要再跑 `hermes update`：它会把代码切回官方版本，补丁就失效了。回滚：切回上游 tag 对应的提交再重启。
 
 ## 升级
 
@@ -18,7 +20,7 @@ git fetch upstream --tags
 git rebase --onto <新 tag> <旧 tag> ziyou/patches   # 冲突时逐个解决；上游已修好的补丁直接丢掉
 ```
 
-然后跑测试，更新上面的「当前基线」，再按需要切换运行目录、重启网关。
+然后跑测试，推到 fork，更新上面的「当前基线」，再按上面的部署步骤切换运行目录、重启网关。
 
 ## 测试
 
